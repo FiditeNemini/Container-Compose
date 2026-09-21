@@ -1,0 +1,102 @@
+name: Release
+
+# RELEASE_TOKEN needs Contents: Read and write on this repo and
+# Mcrich23/homebrew-formulae, with permission to bypass main's PR requirement.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version (e.g. 1.2.3, without v)'
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: macos-26
+    if: github.ref == 'refs/heads/main'
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Update version
+        run: |
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          version = os.environ['VERSION']
+          assert re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version), 'Use MAJOR.MINOR.PATCH'
+          path = Path('Sources/Container-Compose/Application.swift')
+          source = path.read_text()
+          pattern = r'private static let version: String = "([^"]+)"'
+          current = re.search(pattern, source)[1]
+          assert tuple(map(int, version.split('.'))) > tuple(map(int, current.split('.'))), 'Version must increase'
+          source, count = re.subn(pattern, f'private static let version: String = "{version}"', source)
+          assert count == 1, 'Expected one version declaration'
+          path.write_text(source)
+          PY
+
+      - name: Build release binary
+        run: |
+          swift build --build-system native -c release --product Container-Compose --force-resolved-versions
+          git diff --exit-code -- Package.resolved
+          bin_dir="$(swift build --build-system native -c release --show-bin-path)"
+          mkdir -p dist
+          install -m 755 "$bin_dir/Container-Compose" dist/container-compose
+          [[ "$(dist/container-compose --version)" == "container-compose version $VERSION" ]]
+
+      - name: Commit, tag, and publish
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Sources/Container-Compose/Application.swift
+          git commit -m "Release $VERSION"
+          git tag -a "$VERSION" -m "Release $VERSION"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$VERSION"
+          gh release create "$VERSION" dist/container-compose --verify-tag --generate-notes --title "$VERSION"
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: Mcrich23/homebrew-formulae
+          ref: main
+          path: homebrew-tap
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Update Homebrew formula
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, re
+          from pathlib import Path
+          path = Path('homebrew-tap/Formula/container-compose.rb')
+          source = path.read_text()
+          version = os.environ['VERSION']
+          digest = hashlib.sha256(Path('dist/container-compose').read_bytes()).hexdigest()
+          source, urls = re.subn(r'(/releases/download/)[^/]+(/container-compose")', rf'\g<1>{version}\2', source)
+          source, hashes = re.subn(r'sha256 "[a-f0-9]+"', f'sha256 "{digest}"', source)
+          assert urls == hashes == 1, 'Expected one release URL and checksum'
+          source = re.sub(r'(?m)^  version "[^"]+"', f'  version "{version}"', source)
+          source = re.sub(r'(?m)^\s*#.*(?:universal|architectures).*\n', '\n', source)
+          source = source.replace('depends_on :macos', 'depends_on arch: :arm64\n  depends_on macos: :sequoia')
+          path.write_text(source)
+          PY
+          cd homebrew-tap
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Formula/container-compose.rb
+          git commit -m "container-compose $VERSION"
+          git push origin HEAD:refs/heads/main
